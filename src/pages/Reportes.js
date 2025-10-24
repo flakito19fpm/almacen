@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react'
 import { supabase } from '../utils/supabase'
-import { FileBarChart, Calendar, Filter, Download } from 'lucide-react'
+import { FileBarChart, Calendar, Filter, Download, AlertTriangle } from 'lucide-react'
 
 const LOW_STOCK_FALLBACK = 5 // si el producto no tiene min_stock
 
@@ -16,8 +16,8 @@ const Reportes = () => {
   const [tipoReporte, setTipoReporte] = useState('entradas') // 'entradas' | 'salidas' | 'cero' | 'baja'
   const [rows, setRows] = useState([]) // filas mostradas en la tabla
   const [loading, setLoading] = useState(false)
+  const [uiError, setUiError] = useState('')
 
-  // utilidades
   const hasDates = useMemo(() => Boolean(fechaInicio && fechaFin), [fechaInicio, fechaFin])
 
   useEffect(() => {
@@ -25,39 +25,62 @@ const Reportes = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Helpers de fecha
+  function withRange(q) {
+    if (hasDates) {
+      q = q.gte('fecha', fechaInicio).lte('fecha', fechaFin)
+    }
+    return q
+  }
+
   async function generarReportes(applyFilter = false) {
     setLoading(true)
+    setUiError('')
     try {
-      // --- 1) Datos base para tarjetas (pueden respetar el filtro si applyFilter === true)
-      const entradasCountQuery = supabase.from('entradas').select('*', { count: 'exact', head: true })
-      const salidasCountQuery = supabase.from('salidas').select('*', { count: 'exact', head: true })
+      // --- 1) Totales (con o sin rango)
+      const entradasCountQ = supabase.from('entradas').select('*', { count: 'exact', head: true })
+      const salidasCountQ  = supabase.from('salidas').select('*',  { count: 'exact', head: true })
 
-      const entradasAggQuery = supabase.from('entradas').select('producto_id, cantidad, fecha')
-      const salidasAggQuery = supabase.from('salidas').select('producto_id, cantidad, fecha')
-      const productosQuery = supabase.from('productos').select('*')
-
-      // aplicar rango de fechas si corresponde
-      const withDate = (q) =>
-        applyFilter && hasDates ? q.gte('fecha', fechaInicio).lte('fecha', fechaFin) : q
-
-      const [{ count: totalEntradas = 0 }, { count: totalSalidas = 0 }] = await Promise.all([
-        withDate(entradasCountQuery),
-        withDate(salidasCountQuery)
+      const [entradasCountRes, salidasCountRes] = await Promise.all([
+        applyFilter ? withRange(entradasCountQ) : entradasCountQ,
+        applyFilter ? withRange(salidasCountQ)  : salidasCountQ
       ])
 
-      const [{ data: productosData = [] }, { data: entradasData = [] }, { data: salidasData = [] }] =
-        await Promise.all([productosQuery, withDate(entradasAggQuery), withDate(salidasAggQuery)])
+      if (entradasCountRes.error) throw entradasCountRes.error
+      if (salidasCountRes.error)  throw salidasCountRes.error
 
-      // calcular stock por producto a partir de entradas - salidas
+      const totalEntradas = entradasCountRes.count || 0
+      const totalSalidas  = salidasCountRes.count || 0
+
+      // --- 2) Productos + movimientos para calcular stock actual
+      const productosRes = await supabase.from('productos').select('*')
+      if (productosRes.error) throw productosRes.error
+      const productosData = productosRes.data || []
+
+      const entradasAggQ = supabase.from('entradas').select('producto_id, cantidad, fecha')
+      const salidasAggQ  = supabase.from('salidas').select('producto_id, cantidad, fecha')
+
+      const [entradasAggRes, salidasAggRes] = await Promise.all([
+        applyFilter ? withRange(entradasAggQ) : entradasAggQ,
+        applyFilter ? withRange(salidasAggQ)  : salidasAggQ
+      ])
+      if (entradasAggRes.error) throw entradasAggRes.error
+      if (salidasAggRes.error)  throw salidasAggRes.error
+
+      const entradasData = entradasAggRes.data || []
+      const salidasData  = salidasAggRes.data || []
+
       const sumBy = (arr) => {
-        const m = {}
-        arr?.forEach((r) => {
-          m[r.producto_id] = (m[r.producto_id] || 0) + Number(r.cantidad || 0)
-        })
-        return m
+        const acc = {}
+        for (const r of arr) {
+          const pid = r.producto_id
+          const cant = Number(r.cantidad || 0)
+          acc[pid] = (acc[pid] || 0) + cant
+        }
+        return acc
       }
       const entradasPorProducto = sumBy(entradasData)
-      const salidasPorProducto = sumBy(salidasData)
+      const salidasPorProducto  = sumBy(salidasData)
 
       const productosConStock = productosData.map((p) => {
         const stock = (entradasPorProducto[p.id] || 0) - (salidasPorProducto[p.id] || 0)
@@ -66,7 +89,7 @@ const Reportes = () => {
       })
 
       const valorStock = productosConStock.reduce(
-        (sum, p) => sum + (Number(p.stock) * Number(p.precio_venta || 0)),
+        (sum, p) => sum + Number(p.stock) * Number(p.precio_venta || 0),
         0
       )
       const gananciasEstimadas = productosConStock.reduce(
@@ -75,35 +98,52 @@ const Reportes = () => {
         0
       )
 
-      setReportes({
-        totalEntradas,
-        totalSalidas,
-        valorStock,
-        gananciasEstimadas
-      })
+      setReportes({ totalEntradas, totalSalidas, valorStock, gananciasEstimadas })
 
-      // --- 2) Filas de la tabla según tipo de reporte
+      // --- 3) Filas según tipo de reporte
       if (tipoReporte === 'entradas' || tipoReporte === 'salidas') {
-        // movimientos con join de producto
         const table = tipoReporte === 'entradas' ? 'entradas' : 'salidas'
+
+        // IMPORTANTE:
+        // Si tu FK es producto_id → productos.id, usa alias explícito:
+        // 'productos:producto_id (nombre, codigo)'
+        // Si no tienes FK en Supabase, quita el join y muestra solo producto_id.
         let q = supabase
           .from(table)
-          .select('id, fecha, cantidad, productos(nombre, codigo)')
+          .select('id, fecha, cantidad, producto_id, productos:producto_id (nombre, codigo)')
           .order('fecha', { ascending: false })
 
-        if (applyFilter && hasDates) {
-          q = q.gte('fecha', fechaInicio).lte('fecha', fechaFin)
+        if (applyFilter && hasDates) q = withRange(q)
+
+        const { data: movs, error } = await q
+        if (error) {
+          // fallback: intenta un select sin join si el error viene del join
+          console.warn('Fallo join a productos, usando fallback:', error.message)
+          const { data: movsFallback, error: err2 } = await (applyFilter && hasDates
+            ? withRange(supabase.from(table).select('id, fecha, cantidad, producto_id').order('fecha', { ascending: false }))
+            : supabase.from(table).select('id, fecha, cantidad, producto_id').order('fecha', { ascending: false })
+          )
+          if (err2) throw err2
+
+          const nombrePorId = Object.fromEntries(productosData.map(p => [p.id, p.nombre || '']))
+          const codigoPorId = Object.fromEntries(productosData.map(p => [p.id, p.codigo || '']))
+
+          const asRows = (movsFallback || []).map((m) => ({
+            Fecha: new Date(m.fecha).toLocaleString(),
+            Codigo: codigoPorId[m.producto_id] || '',
+            Producto: nombrePorId[m.producto_id] || '',
+            Cantidad: Number(m.cantidad || 0)
+          }))
+          setRows(asRows)
+        } else {
+          const asRows = (movs || []).map((m) => ({
+            Fecha: new Date(m.fecha).toLocaleString(),
+            Codigo: m.productos?.codigo ?? '',
+            Producto: m.productos?.nombre ?? '',
+            Cantidad: Number(m.cantidad || 0)
+          }))
+          setRows(asRows)
         }
-
-        const { data: movimientos = [] } = await q
-
-        const asRows = movimientos.map((m) => ({
-          Fecha: new Date(m.fecha).toLocaleString(),
-          Codigo: m.productos?.codigo ?? '',
-          Producto: m.productos?.nombre ?? '',
-          Cantidad: Number(m.cantidad || 0)
-        }))
-        setRows(asRows)
       } else if (tipoReporte === 'cero') {
         const asRows = productosConStock
           .filter((p) => Number(p.stock) === 0)
@@ -127,12 +167,14 @@ const Reportes = () => {
       }
     } catch (error) {
       console.error('Error generando reportes:', error)
+      setUiError(error?.message || String(error))
+      setRows([])
     } finally {
       setLoading(false)
     }
   }
 
-  // exportar CSV de lo que esté en la tabla
+  // CSV
   function toCSV(data) {
     if (!data || !data.length) return ''
     const cols = Object.keys(data[0])
@@ -165,10 +207,6 @@ const Reportes = () => {
 
   const columnas = useMemo(() => Object.keys(rows[0] || {}), [rows])
 
-  const aplicarFiltro = () => {
-    generarReportes(true)
-  }
-
   return (
     <div className="min-h-screen bg-gradient-to-br from-yellow-50 to-orange-100 p-6">
       <div className="max-w-7xl mx-auto">
@@ -198,7 +236,7 @@ const Reportes = () => {
         </div>
 
         {/* Filtros */}
-        <div className="flex flex-wrap items-center gap-3 mb-6">
+        <div className="flex flex-wrap items-center gap-3 mb-4">
           <select
             value={tipoReporte}
             onChange={(e) => setTipoReporte(e.target.value)}
@@ -244,13 +282,21 @@ const Reportes = () => {
           </button>
         </div>
 
-        {/* Resumen del reporte actual */}
-        <div className="mb-3 text-sm text-gray-700">
-          {tipoReporte === 'entradas' && <>Total entradas (tabla): <b>{totalResumen}</b></>}
-          {tipoReporte === 'salidas' && <>Total salidas (tabla): <b>{totalResumen}</b></>}
-          {tipoReporte === 'cero' && <>Productos en cero: <b>{totalResumen}</b></>}
-          {tipoReporte === 'baja' && <>Productos con baja existencia: <b>{totalResumen}</b></>}
-          {hasDates && <span className="ml-2 text-gray-500">• Rango: {fechaInicio} a {fechaFin}</span>}
+        {/* Resumen + error */}
+        <div className="mb-3 text-sm text-gray-700 flex items-center gap-3">
+          <span>
+            {tipoReporte === 'entradas' && <>Total entradas (tabla): <b>{totalResumen}</b></>}
+            {tipoReporte === 'salidas' && <>Total salidas (tabla): <b>{totalResumen}</b></>}
+            {tipoReporte === 'cero' && <>Productos en cero: <b>{totalResumen}</b></>}
+            {tipoReporte === 'baja' && <>Productos con baja existencia: <b>{totalResumen}</b></>}
+            {hasDates && <span className="ml-2 text-gray-500">• Rango: {fechaInicio} a {fechaFin}</span>}
+          </span>
+          {!!uiError && (
+            <span className="flex items-center gap-1 text-red-600">
+              <AlertTriangle className="w-4 h-4" />
+              {uiError}
+            </span>
+          )}
         </div>
 
         {/* Tabla */}
@@ -259,20 +305,14 @@ const Reportes = () => {
             <table className="min-w-full divide-y divide-gray-200">
               <thead className="bg-gray-50">
                 <tr>
-                  {columnas.length
-                    ? columnas.map((c) => (
-                        <th
-                          key={c}
-                          className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
-                        >
-                          {c}
-                        </th>
-                      ))
-                    : (
-                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        Sin datos
-                      </th>
-                    )}
+                  {(columnas.length ? columnas : ['Sin datos']).map((c) => (
+                    <th
+                      key={c}
+                      className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
+                    >
+                      {c}
+                    </th>
+                  ))}
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-gray-200">
@@ -304,7 +344,7 @@ const Reportes = () => {
           </div>
         </div>
 
-        {/* Acción para refrescar cuando cambie el tipo de reporte */}
+        {/* Botón de refresco */}
         <div className="mt-4 flex gap-2">
           <button
             onClick={() => generarReportes(hasDates)}
