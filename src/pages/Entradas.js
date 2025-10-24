@@ -31,7 +31,7 @@ const Entradas = () => {
       .from('entradas')
       .select(`
         *, 
-        productos!entradas_producto_id_fkey(id, nombre),
+        productos!entradas_producto_id_fkey(id, clave, nombre),
         proveedores!entradas_proveedor_id_fkey(id, nombre_comercial)
       `)
       .order('fecha', { ascending: false });
@@ -47,7 +47,7 @@ const Entradas = () => {
   };
 
   const fetchProductos = async () => {
-    const { data, error } = await supabase.from('productos').select('id, nombre');
+    const { data, error } = await supabase.from('productos').select('id, clave, nombre');
     if (error) {
       console.error('Error fetching productos:', error);
       showToast('error', 'Error al cargar productos: ' + (error.message || 'Inténtalo de nuevo'));
@@ -70,7 +70,7 @@ const Entradas = () => {
 
   const addEntrada = async () => {
     if (!newEntrada.producto_id || !newEntrada.cantidad || newEntrada.cantidad <= 0) {
-      showToast('error', 'Producto y cantidad son obligatorios (mayor a 0)');
+      showToast('error', 'Código del producto y cantidad son obligatorios (mayor a 0)');
       return;
     }
     const fecha = newEntrada.fecha || new Date().toISOString().split('T')[0];
@@ -109,6 +109,7 @@ const Entradas = () => {
 
   const filteredEntradas = entradas.filter(e =>
     new Date(e.fecha).toLocaleDateString().includes(search) ||
+    e.productos?.clave?.toLowerCase().includes(search.toLowerCase()) ||
     e.productos?.nombre?.toLowerCase().includes(search.toLowerCase()) ||
     e.proveedores?.nombre_comercial?.toLowerCase().includes(search.toLowerCase())
   );
@@ -126,7 +127,7 @@ const Entradas = () => {
             <Search className="w-5 h-5 text-gray-500" />
             <input
               type="text"
-              placeholder="Buscar por fecha, producto o proveedor..."
+              placeholder="Buscar por código, nombre, fecha o proveedor..."
               value={search}
               onChange={handleSearch}
               className="flex-1 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
@@ -140,9 +141,11 @@ const Entradas = () => {
               className="px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 required:border-blue-500"
               required
             >
-              <option value="">Seleccionar Producto *</option>
+              <option value="">Seleccionar Código del Producto *</option>
               {productos.map(prod => (
-                <option key={prod.id} value={prod.id}>{prod.nombre}</option>
+                <option key={prod.id} value={prod.id}>
+                  {prod.clave} - {prod.nombre}
+                </option>
               ))}
             </select>
             <input
@@ -185,11 +188,12 @@ const Entradas = () => {
           <table className="min-w-full divide-y divide-gray-200">
             <thead className="bg-gray-50">
               <tr>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Producto</th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Fecha</th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Cantidad</th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Proveedor</th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Acciones</th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-32">Código</th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-48">Nombre</th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-32">Fecha</th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-24">Cantidad</th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-56">Proveedor</th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-16">Acciones</th>
               </tr>
             </thead>
             <tbody className="bg-white divide-y divide-gray-200">
@@ -197,7 +201,10 @@ const Entradas = () => {
                 filteredEntradas.map((entrada) => (
                   <tr key={entrada.id}>
                     <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                      {entrada.productos?.nombre || 'Sin producto'}
+                      {entrada.productos?.clave || 'Sin código'}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                      {entrada.productos?.nombre || 'Sin nombre'}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                       {new Date(entrada.fecha).toLocaleDateString()}
@@ -220,7 +227,7 @@ const Entradas = () => {
                 ))
               ) : (
                 <tr>
-                  <td colSpan="5" className="px-6 py-8 text-center text-gray-500">
+                  <td colSpan="6" className="px-6 py-8 text-center text-gray-500">
                     No hay entradas aún. ¡Agrega una para empezar!
                   </td>
                 </tr>
